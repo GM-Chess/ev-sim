@@ -1,0 +1,22 @@
+# Python virtual environments
+env/
+venv/
+.env/
+.venv/
+__pycache__/
+
+# MkDocs build output
+/site/
+
+# macOS files
+.DS_Store
+
+# VS Code settings
+.vscode/
+
+# JetBrains IDE settings
+.idea/
+
+# Logs and temporary files
+*.log
+*.tmp

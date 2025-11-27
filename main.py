@@ -18,27 +18,31 @@ class VehicleSimulation:
         """Update actual vehicle speed based on motor torque"""
         wheel_torque = motor_torque * var.gearRatio * 0.95
         traction_force = wheel_torque / var.wheelRadius
-        
+
         # Resistance forces at CURRENT speed
-        roll_force = func.fRoll(self.actual_speed)
-        aero_force = func.fAerodynamic(self.actual_speed)
+        roll_force = -func.fRoll(self.actual_speed)  # NEGATIVE because they oppose motion
+        aero_force = -func.fAerodynamic(self.actual_speed)  # NEGATIVE
         total_resistance = roll_force + aero_force
         
-        net_force = traction_force - total_resistance  # FIXED: resistance should oppose motion
+        net_force = traction_force + total_resistance
         
-        # Improved zero speed handling
-        if abs(self.actual_speed) < 0.001 and net_force <= 0:
-            # Vehicle is stopped and no positive force to move it
+        # Check for numerical issues
+        if np.isnan(net_force) or np.isinf(net_force):
+            print(f"ERROR: net_force is {net_force}")
+            print(f"  traction_force={traction_force}, roll={roll_force}, aero={aero_force}")
+            print(f"  motor_torque={motor_torque}, speed={self.actual_speed}")
+            return self.actual_speed, 0.0
+        
+        if self.actual_speed == 0 and net_force <= 0:
             self.actual_acceleration = 0
         else:
-            # Normal acceleration calculation
             self.actual_acceleration = net_force / (var.vehicleMass * var.rotationalInertiaCoeff)
         
-        # Update speed with numerical stability
+        # Update speed
         new_speed = self.actual_speed + self.actual_acceleration * dt
-        self.actual_speed = max(0, new_speed)  # Prevent negative speed
+        self.actual_speed = max(0, new_speed)
         
-        return self.actual_speed, self.actual_acceleration 
+        return self.actual_speed, self.actual_acceleration    
 
 vehicle = VehicleSimulation()
 batteryPack = bc.BatteryPack()
@@ -46,376 +50,552 @@ batteryPack = bc.BatteryPack()
 HWFETdata = pd.read_csv('HWFET.csv')
 HWTime = HWFETdata['Time (seconds)'].values
 HWSpeed = HWFETdata['Speed (mph)'].values / 2.237
-HWaccDesired = np.gradient(HWSpeed, HWTime)
 HWdistance = np.trapezoid(HWSpeed, HWTime)
 
 HWresults = []
+DEBUG = False  # Set to False to disable debug prints
 
-# FIX: Pre-calculate interpolation to avoid issues
-interpolation_factor = 5  # Reduced for stability
-total_interpolated_points = len(HWTime) * interpolation_factor
-interpolated_time = np.linspace(HWTime[0], HWTime[-1], total_interpolated_points)
-interpolated_desired_speed = np.interp(interpolated_time, HWTime, HWSpeed)
-
-# Calculate dt for interpolated points
-interp_dt = (HWTime[-1] - HWTime[0]) / (total_interpolated_points - 1)
-
-print(f"Original time steps: {len(HWTime)}")
-print(f"Interpolated time steps: {total_interpolated_points}")
-print(f"Interpolated dt: {interp_dt:.4f}s")
-
-for i in range(total_interpolated_points):
-    desired_speed = interpolated_desired_speed[i]
-    current_time = interpolated_time[i]
+for i in range(max(len(HWTime), 50)):  # Limit to 50 for testing
+    desired_speed = HWSpeed[i]
     
-    # DEBUG: Track what's happening around problematic region
-    if 710 <= current_time <= 720:
-        print(f"\nStep {i}: Time={current_time:.1f}s, Desired={desired_speed:.2f}m/s, Actual={vehicle.actual_speed:.2f}m/s")
-    
-    V_ref, vehicle.integral = func.pi_controller(desired_speed, vehicle.actual_speed, vehicle.integral, interp_dt)
-    speed_error = desired_speed - vehicle.actual_speed
-    
-    # Mode determination
-    if speed_error > 0.1:
-        mode = "DRIVING"
-        V_batt = batteryPack.update_battery_voltage()
-        V_motor, V_arm = func.buckConverter(batteryPack.soc, V_batt, V_ref)
-    elif speed_error < -0.1:
-        mode = "BRAKING" 
-        V_batt = batteryPack.update_battery_voltage()
-        V_motor, V_arm = func.regenerativeBrakeConverter(batteryPack.soc, V_batt, abs(V_ref))
-    else:
-        mode = "COASTING"
-        V_batt = batteryPack.update_battery_voltage()
-        V_motor, V_arm = func.buckConverter(batteryPack.soc, V_batt, V_ref)
-    
-    motor_angular_vel = func.angularVelocity(vehicle.actual_speed, var.gearRatio)
-    
-    # Calculate desired acceleration from interpolated speed profile
     if i == 0:
-        acc_desired = 0
+        dt = HWTime[0]
     else:
-        acc_desired = (interpolated_desired_speed[i] - interpolated_desired_speed[i-1]) / interp_dt
+        dt = HWTime[i] - HWTime[i-1]
     
-    # FIX: Add safety check for angular velocity calculations
-    wheel_angular_vel = func.angularVelocity(desired_speed, 1)
-    if abs(wheel_angular_vel) < 0.001:  # Avoid division by near-zero
-        required_wheel_torque = 0
-    else:
-        f_tr_desired = (var.rotationalInertiaCoeff * var.vehicleMass * acc_desired + 
-                        func.fRoll(desired_speed) + 
-                        func.fAerodynamic(desired_speed) + 
-                        func.fgxt())
+    # Create interpolated substeps
+    lineSpaceRange = np.linspace(HWTime[i - 1] if i > 0 else 0, HWTime[i], 100)
+    HWyInterp = np.interp(lineSpaceRange, HWTime, HWSpeed)
+    dt_substep = dt / len(lineSpaceRange)
+    
+    if DEBUG and i % 5 == 0:
+        print(f"\n{'='*70}")
+        print(f"TIME STEP {i}: t={HWTime[i]:.1f}s, desired_speed={desired_speed:.2f} m/s")
+        print(f"  Current actual_speed={vehicle.actual_speed:.2f} m/s")
+        print(f"  dt={dt:.3f}s, dt_substep={dt_substep:.6f}s, num_substeps={len(lineSpaceRange)}")
+    
+    # Track cumulative torque application
+    total_torque_impulse = 0
+    substep_count = {'DRIVING': 0, 'BRAKING': 0, 'COASTING': 0}
+    
+    for j in range(len(HWyInterp)):
+        # PI controller generates voltage reference
+        V_ref, vehicle.integral = func.pi_controller(
+            HWyInterp[j], vehicle.actual_speed, vehicle.integral, dt_substep
+        )
         
-        required_power = func.powerFromForce(abs(f_tr_desired), desired_speed)
-        required_wheel_torque = required_power / wheel_angular_vel
+        speed_error = HWyInterp[j] - vehicle.actual_speed
+        
+        # Get battery voltage
+        V_batt = batteryPack.update_battery_voltage()
+        
+        # Determine mode and get motor voltage
+        if speed_error > 0.1:
+            mode = "DRIVING"
+            V_motor, V_arm = func.buckConverter(batteryPack.soc, V_batt, V_ref)
+        elif speed_error < -0.1:
+            mode = "BRAKING"
+            V_motor, V_arm = func.regenerativeBrakeConverter(
+                batteryPack.soc, V_batt, abs(V_ref)
+            )
+        else:
+            mode = "COASTING"
+            V_motor = 0
+            V_arm = 0
+        
+        substep_count[mode] += 1
+        
+        # CRITICAL FIX: If V_motor is 0, we cannot produce torque
+        if abs(V_motor) < 0.1:
+            motor_current = 0
+            motor_torque = 0
+        else:
+            motor_angular_vel = func.angularVelocity(vehicle.actual_speed, var.gearRatio)
+            
+            # Calculate desired acceleration for THIS substep
+            if j == 0:
+                acc_desired = 0
+            else:
+                acc_desired = (HWyInterp[j] - HWyInterp[j-1]) / dt_substep
+            
+            # CRITICAL FIX: Resistance forces are NEGATIVE (oppose motion)
+            f_tr_desired = (var.rotationalInertiaCoeff * var.vehicleMass * acc_desired + 
+                            func.fRoll(HWyInterp[j]) + 
+                            func.fAerodynamic(HWyInterp[j]))
+            
+            required_power = func.powerFromForce(abs(f_tr_desired), HWyInterp[j])
+            wheel_angular_vel = func.angularVelocity(HWyInterp[j], 1)
+            required_wheel_torque = required_power / wheel_angular_vel if wheel_angular_vel > 0.01 else 0
+            required_motor_torque = required_wheel_torque / var.gearRatio
+            
+            # Apply sign based on mode
+            if mode == "BRAKING":
+                required_motor_torque = -abs(required_motor_torque)
+            else:
+                required_motor_torque = abs(required_motor_torque)
+            
+            # Calculate actual achievable current and torque
+            motor_current = func.currentFromTorqueAndSpeed(
+                motor_angular_vel, required_motor_torque, V_motor
+            )
+            motor_torque = motor_current * var.motorConstant
+            
+            # Check for NaN/Inf
+            if np.isnan(motor_torque) or np.isinf(motor_torque):
+                print(f"ERROR at i={i}, j={j}: motor_torque is {motor_torque}")
+                print(f"  motor_current={motor_current}, V_motor={V_motor}")
+                print(f"  required_motor_torque={required_motor_torque}")
+                motor_torque = 0
+                motor_current = 0
+        
+        # CRITICAL FIX: Update vehicle dynamics at EACH substep!
+        actual_speed, actual_accel = vehicle.update_vehicle_dynamics(
+            motor_torque, dt_substep
+        )
+        
+        # Update battery for this substep
+        soc, pack_voltage, _ = batteryPack.update_battery(motor_current, dt_substep)
+        
+        total_torque_impulse += motor_torque * dt_substep
+        
+        # Store the final values from this substep
+        vehicle.motor_current = motor_current
+        vehicle.motor_torque = motor_torque
+        vehicle.motor_voltage = V_motor
+        
+        # Check for runaway
+        if vehicle.actual_speed > 100:  # 100 m/s = 360 km/h, clearly wrong
+            print(f"\nERROR: Speed runaway detected at i={i}, j={j}")
+            print(f"  Speed={vehicle.actual_speed:.2f} m/s")
+            print(f"  motor_torque={motor_torque:.2f} Nm")
+            print(f"  mode={mode}, V_motor={V_motor:.2f} V")
+            raise ValueError("Simulation diverged - speed runaway")
     
-    required_motor_torque = required_wheel_torque / var.gearRatio
+    # Debug output for this major time step
+    if DEBUG and i % 5 == 0:
+        print(f"\n  Substep summary: {substep_count}")
+        print(f"  Total torque impulse: {total_torque_impulse:.2f} Nm·s")
+        print(f"  Final speed: {vehicle.actual_speed:.2f} m/s")
+        print(f"  Final acceleration: {vehicle.actual_acceleration:.3f} m/s²")
+        print(f"  Speed error: {desired_speed - vehicle.actual_speed:.2f} m/s")
+        print(f"  Battery SOC: {soc:.1f}%")
     
-    # Apply mode-specific torque sign
-    if mode == "BRAKING":
-        required_motor_torque = -abs(required_motor_torque)
-    else:
-        required_motor_torque = abs(required_motor_torque)
-    
-    # Calculate motor current and torque with safety checks
-    vehicle.motor_current = func.currentFromTorqueAndSpeed(
-        motor_angular_vel, required_motor_torque, V_motor
-    )
-    
-    # FIX: Add bounds checking for motor current/torque
-    vehicle.motor_current = np.clip(vehicle.motor_current, -var.ratedArmatureCurrent, var.ratedArmatureCurrent)
-    vehicle.motor_torque = vehicle.motor_current * var.motorConstant
-    
-    # Update vehicle dynamics
-    actual_speed, actual_accel = vehicle.update_vehicle_dynamics(vehicle.motor_torque, interp_dt)
-    
-    # Update battery
-    soc, pack_voltage, _ = batteryPack.update_battery(vehicle.motor_current, interp_dt)
-    
-    # DEBUG: Check for problematic states
-    if 710 <= current_time <= 720:
-        print(f"  Mode={mode}, MotorTorque={vehicle.motor_torque:.2f}Nm, "
-              f"Accel={actual_accel:.3f}m/s², Speed={vehicle.actual_speed:.3f}m/s")
-    
-    # Store results at original time steps (for cleaner plotting)
-    original_time_indices = np.searchsorted(HWTime, current_time, side='right') - 1
-    if original_time_indices >= 0 and (i == total_interpolated_points - 1 or 
-                                       abs(current_time - HWTime[original_time_indices]) < interp_dt/2):
-        HWresults.append({
-            'time': current_time,
-            'desired_speed': desired_speed,  # FIX: This should now be correct
-            'actual_speed': vehicle.actual_speed,
-            'actual_acceleration': actual_accel,
-            'motor_torque': vehicle.motor_torque,
-            'motor_current': vehicle.motor_current,
-            'motor_voltage': V_motor,
-            'battery_voltage': pack_voltage,
-            'soc': soc,
-            'V_ref': V_ref,
-            'mode': mode
-        })
+    # Save results for this major time step
+    HWresults.append({
+        'time': HWTime[i],
+        'desired_speed': desired_speed,
+        'actual_speed': vehicle.actual_speed,
+        'actual_acceleration': vehicle.actual_acceleration,
+        'motor_torque': vehicle.motor_torque,
+        'motor_current': vehicle.motor_current,
+        'motor_voltage': vehicle.motor_voltage,
+        'battery_voltage': pack_voltage,
+        'soc': soc,
+        'V_ref': V_ref,
+        'mode': mode
+    })
+
+print("\n" + "="*70)
+print("Simulation completed successfully!")
+print(f"Final speed: {vehicle.actual_speed:.2f} m/s")
+print(f"Final SOC: {soc:.1f}%")
 
 HWresults_df = pd.DataFrame(HWresults)
 
-plt.figure()
-plt.plot(HWresults_df['time'], HWresults_df['actual_speed'], label='Actual Speed', color='green')
-plt.plot(HWresults_df['time'], HWresults_df['desired_speed'], label='Desired Speed', color='orange', linestyle='--')
-plt.title('HW Vehicle Acceleration and Speed vs Time')
-plt.xlabel('Time (seconds)')
-plt.ylabel('Acceleration (m/s²) / Speed (m/s)   ')
-plt.legend()
-plt.grid()
+# Plot results
+plt.figure(figsize=(12, 8))
 
-plt.figure()
-plt.plot(HWresults_df['time'], HWresults_df['soc'], label='State of Charge (SOC)', color='blue')
-plt.title('HW Battery State of Charge vs Time')
-plt.xlabel('Time (seconds)')
+plt.subplot(2, 2, 1)
+plt.plot(HWresults_df['time'], HWresults_df['actual_speed'], label='Actual Speed', color='green', linewidth=2)
+plt.plot(HWresults_df['time'], HWresults_df['desired_speed'], label='Desired Speed', color='orange', linestyle='--', linewidth=2)
+plt.title('Vehicle Speed vs Time')
+plt.xlabel('Time (s)')
+plt.ylabel('Speed (m/s)')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(2, 2, 2)
+plt.plot(HWresults_df['time'], HWresults_df['soc'], label='SOC', color='blue', linewidth=2)
+plt.title('Battery State of Charge')
+plt.xlabel('Time (s)')
 plt.ylabel('SOC (%)')
 plt.legend()
-plt.grid()
+plt.grid(True)
 
-plt.figure()
-plt.plot(HWresults_df['time'], HWresults_df['battery_voltage'], label='Battery Voltage', color='red')
-plt.title('HW Battery Voltage vs Time')
-plt.xlabel('Time (seconds)')
-plt.ylabel('Battery Voltage (V)')
+plt.subplot(2, 2, 3)
+plt.plot(HWresults_df['time'], HWresults_df['motor_torque'], label='Motor Torque', color='red', linewidth=2)
+plt.title('Motor Torque')
+plt.xlabel('Time (s)')
+plt.ylabel('Torque (Nm)')
 plt.legend()
-plt.grid()
+plt.grid(True)
 
-plt.figure()
-plt.plot(HWresults_df['time'], HWresults_df['motor_current'], label='Battery Current', color='purple')
-plt.title('HW Battery Current vs Time')
-plt.xlabel('Time (seconds)')
-plt.ylabel('Battery Current (A)')
+plt.subplot(2, 2, 4)
+plt.plot(HWresults_df['time'], HWresults_df['motor_current'], label='Motor Current', color='purple', linewidth=2)
+plt.title('Motor Current')
+plt.xlabel('Time (s)')
+plt.ylabel('Current (A)')
 plt.legend()
-plt.grid()
+plt.grid(True)
+
+plt.tight_layout()
 plt.show()
 
-# UDDSvehicle = VehicleSimulation()
-# UDDSbatteryPack = bc.BatteryPack()
-# UDDSdata = pd.read_csv('UDDS.csv')
-# UDDSTime = UDDSdata['Time (seconds)'].values
-# UDDSSpeed = UDDSdata['Speed (mph)'].values / 2.237
-# UDDSaccDesired = np.gradient(UDDSSpeed, UDDSTime)
-# UDDSdistance = np.trapezoid(UDDSSpeed, UDDSTime)
-# UDDSresults = []
+print(f"\nDistance traveled: {np.trapezoid(HWresults_df['actual_speed'], HWresults_df['time']):.2f} meters")
 
-# for i in range(len(UDDSTime)):
-#     desired_speed = UDDSSpeed[i]
-#     dt = 1
-#     initial_actual_speed = UDDSvehicle.actual_speed
+UDDSVehicleSimulation = VehicleSimulation()
+UDDSBatteryPack = bc.BatteryPack()
+
+UDDSdata = pd.read_csv('UDDS.csv')
+UDDSTime = UDDSdata['Time (seconds)'].values
+UDDSSpeed = UDDSdata['Speed (mph)'].values / 2.237
+UDDSdistance = np.trapezoid(UDDSSpeed, UDDSTime)
+UDDSresults = []
+DEBUG = False  # Set to False to disable debug prints
+for i in range(max(len(UDDSTime), 50)):  # Limit to 50 for testing
+    desired_speed = UDDSSpeed[i]
     
-#     V_ref, UDDSvehicle.integral = func.pi_controller(desired_speed, UDDSvehicle.actual_speed, UDDSvehicle.integral, dt)
+    if i == 0:
+        dt = UDDSTime[0]
+    else:
+        dt = UDDSTime[i] - UDDSTime[i-1]
     
-#     speed_error = desired_speed - UDDSvehicle.actual_speed
+    # Create interpolated substeps
+    lineSpaceRange = np.linspace(UDDSTime[i - 1] if i > 0 else 0, UDDSTime[i], 1000)
+    UDDSyInterp = np.interp(lineSpaceRange, UDDSTime, UDDSSpeed)
+    dt_substep = dt / len(lineSpaceRange)
     
-#     if speed_error > 0.1:
-#         mode = "DRIVING"
-#         V_batt = UDDSbatteryPack.update_battery_voltage()
-#         V_motor, V_arm = func.buckConverter(UDDSbatteryPack.soc, V_batt, V_ref)
-#         motor_current_sign = 1
+    if DEBUG and i % 5 == 0:
+        print(f"\n{'='*70}")
+        print(f"TIME STEP {i}: t={UDDSTime[i]:.1f}s, desired_speed={desired_speed:.2f} m/s")
+        print(f"  Current actual_speed={UDDSVehicleSimulation.actual_speed:.2f} m/s")
+        print(f"  dt={dt:.3f}s, dt_substep={dt_substep:.6f}s, num_substeps={len(lineSpaceRange)}")
+    
+    # Track cumulative torque application
+    total_torque_impulse = 0
+    substep_count = {'DRIVING': 0, 'BRAKING': 0, 'COASTING': 0}
+    
+    for j in range(len(UDDSyInterp)):
+        # PI controller generates voltage reference
+        V_ref, UDDSVehicleSimulation.integral = func.pi_controller(
+            UDDSyInterp[j], UDDSVehicleSimulation.actual_speed, UDDSVehicleSimulation.integral, dt_substep
+        )
         
-#     elif speed_error < -0.1:
-#         mode = "BRAKING"
-#         V_batt = UDDSbatteryPack.update_battery_voltage()
-#         V_motor, V_arm = func.regenerativeBrakeConverter(UDDSbatteryPack.soc, V_batt, abs(V_ref))
-#         motor_current_sign = -1
+        speed_error = UDDSyInterp[j] - UDDSVehicleSimulation.actual_speed
         
-#     else:
-#         mode = "COASTING"
-#         V_batt = UDDSbatteryPack.update_battery_voltage()
-#         V_motor, V_arm = func.buckConverter(UDDSbatteryPack.soc, V_batt, V_ref)
-#         motor_current_sign = 1
+        # Get battery voltage
+        V_batt = UDDSBatteryPack.update_battery_voltage()
+        
+        # Determine mode and get motor voltage
+        if speed_error > 0.1:
+            mode = "DRIVING"
+            V_motor, V_arm = func.buckConverter(UDDSBatteryPack.soc, V_batt, V_ref)
+        elif speed_error < -0.1:
+            mode = "BRAKING"
+            V_motor, V_arm = func.regenerativeBrakeConverter(
+                UDDSBatteryPack.soc, V_batt, abs(V_ref)
+            )
+        else:
+            mode = "COASTING"
+            V_motor = 0
+            V_arm = 0
+        substep_count[mode] += 1
+        # CRITICAL FIX: If V_motor is 0, we cannot produce torque
+        if abs(V_motor) < 0.1:
+            motor_current = 0
+            motor_torque = 0
+        else:
+            motor_angular_vel = func.angularVelocity(UDDSVehicleSimulation.actual_speed, var.gearRatio)
+            
+            # Calculate desired acceleration for THIS substep
+            if j == 0:
+                acc_desired = 0
+            else:
+                acc_desired = (UDDSyInterp[j] - UDDSyInterp[j-1]) / dt_substep
+            
+            # CRITICAL FIX: Resistance forces are NEGATIVE (oppose motion)
+            f_tr_desired = (var.rotationalInertiaCoeff * var.vehicleMass * acc_desired + 
+                            func.fRoll(UDDSyInterp[j]) + 
+                            func.fAerodynamic(UDDSyInterp[j]))
+            
+            required_power = func.powerFromForce(abs(f_tr_desired), UDDSyInterp[j])
+            wheel_angular_vel = func.angularVelocity(UDDSyInterp[j], 1)
+            required_wheel_torque = required_power / wheel_angular_vel if wheel_angular_vel > 0.01 else 0
+            required_motor_torque = required_wheel_torque / var.gearRatio
+            
+            # Apply sign based on mode
+            if mode == "BRAKING":
+                required_motor_torque = -abs(required_motor_torque)
+            else:
+                required_motor_torque = abs(required_motor_torque)
+            
+            # Calculate actual achievable current and torque
+            motor_current = func.currentFromTorqueAndSpeed(
+                motor_angular_vel, required_motor_torque, V_motor
+            )
+            motor_torque = motor_current * var.motorConstant
+            
+            # Check for NaN/Inf
+            if np.isnan(motor_torque) or np.isinf(motor_torque):
+                print(f"ERROR at i={i}, j={j}: motor_torque is {motor_torque}")
+                print(f"  motor_current={motor_current}, V_motor={V_motor}")
+                print(f"  required_motor_torque={required_motor_torque}")
+                motor_torque = 0
+                motor_current = 0
+        # CRITICAL FIX: Update vehicle dynamics at EACH substep!
+        actual_speed, actual_accel = UDDSVehicleSimulation.update_vehicle_dynamics(
+            motor_torque, dt_substep
+        )
+        # Update battery for this substep
+        soc, pack_voltage, _ = UDDSBatteryPack.update_battery(motor_current, dt_substep)
+        total_torque_impulse += motor_torque * dt_substep
+        # Store the final values from this substep
+        UDDSVehicleSimulation.motor_current = motor_current
+        UDDSVehicleSimulation.motor_torque = motor_torque
+        UDDSVehicleSimulation.motor_voltage = V_motor
+        # Check for runaway
+        if UDDSVehicleSimulation.actual_speed > 100:  # 100 m/s = 360 km/h, clearly wrong
+            print(f"\nERROR: Speed runaway detected at i={i}, j={j}")
+            print(f"  Speed={UDDSVehicleSimulation.actual_speed:.2f} m/s")
+            print(f"  motor_torque={motor_torque:.2f} Nm")
+            print(f"  mode={mode}, V_motor={V_motor:.2f} V")
+            raise ValueError("Simulation diverged - speed runaway") 
+    # Debug output for this major time step
+    if DEBUG and i % 5 == 0:
+        print(f"\n  Substep summary: {substep_count}")
+        print(f"  Total torque impulse: {total_torque_impulse:.2f} Nm·s")
+        print(f"  Final speed: {UDDSVehicleSimulation.actual_speed:.2f} m/s")
+        print(f"  Final acceleration: {UDDSVehicleSimulation.actual_acceleration:.3f} m/s²")
+        print(f"  Speed error: {desired_speed - UDDSVehicleSimulation.actual_speed:.2f} m/s")
+        print(f"  Battery SOC: {soc:.1f}%")
+    # Save results for this major time step
+    UDDSresults.append({
+        'time': UDDSTime[i],
+        'desired_speed': desired_speed,
+        'actual_speed': UDDSVehicleSimulation.actual_speed,
+        'actual_acceleration': UDDSVehicleSimulation.actual_acceleration,
+        'motor_torque': UDDSVehicleSimulation.motor_torque,
+        'motor_current': UDDSVehicleSimulation.motor_current,
+        'motor_voltage': UDDSVehicleSimulation.motor_voltage,
+        'battery_voltage': pack_voltage,
+        'soc': soc,
+        'V_ref': V_ref,
+        'mode': mode
+    })
+
+#plot results
+UDDSresults_df = pd.DataFrame(UDDSresults)
+plt.figure(figsize=(12, 8))
+plt.subplot(2, 2, 1)
+plt.plot(UDDSresults_df['time'], UDDSresults_df['actual_speed'], label='Actual Speed', color='green', linewidth=2)
+plt.plot(UDDSresults_df['time'], UDDSresults_df['desired_speed'], label='Desired Speed', color='orange', linestyle='--', linewidth=2)
+plt.title('Vehicle Speed vs Time (UDDS)')
+plt.xlabel('Time (s)')
+plt.ylabel('Speed (m/s)')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(2, 2, 2)
+plt.plot(UDDSresults_df['time'], UDDSresults_df['soc'], label='SOC', color='blue', linewidth=2)
+plt.title('Battery State of Charge (UDDS)')
+plt.xlabel('Time (s)')
+plt.ylabel('SOC (%)')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(2, 2, 3)
+plt.plot(UDDSresults_df['time'], UDDSresults_df['motor_torque'], label='Motor Torque', color='red', linewidth=2)
+plt.title('Motor Torque (UDDS)')
+plt.xlabel('Time (s)')
+plt.ylabel('Torque (Nm)')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(2, 2, 4)
+plt.plot(UDDSresults_df['time'], UDDSresults_df['motor_current'], label='Motor Current', color='purple', linewidth=2)
+plt.title('Motor Current (UDDS)')
+plt.xlabel('Time (s)')
+plt.ylabel('Current (A)')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()  
+print(f"\nDistance traveled (UDDS): {np.trapezoid(UDDSresults_df['actual_speed'], UDDSresults_df['time']):.2f} meters")
+
+US06VehicleSimulation = VehicleSimulation()
+US06BatteryPack = bc.BatteryPack()
+US06data = pd.read_csv('US06.csv')
+US06Time = US06data['Time (seconds)'].values
+US06Speed = US06data['Speed (mph)'].values / 2.237
+US06distance = np.trapezoid(US06Speed, US06Time)
+US06results = []
+DEBUG = False  # Set to False to disable debug prints
+for i in range(max(len(US06Time), 50)):  # Limit to 50 for testing
+    desired_speed = US06Speed[i]
     
-#     motor_angular_vel = func.angularVelocity(UDDSvehicle.actual_speed, var.gearRatio)
+    if i == 0:
+        dt = US06Time[0]
+    else:
+        dt = US06Time[i] - US06Time[i-1]
     
-#     if i == 0:
-#         acc_desired = 0
-#     else:
-#         acc_desired = (UDDSSpeed[i] - UDDSSpeed[i-1]) / dt
+    # Create interpolated substeps
+    lineSpaceRange = np.linspace(US06Time[i - 1] if i > 0 else 0, US06Time[i], 100)
+    US06yInterp = np.interp(lineSpaceRange, US06Time, US06Speed)
+    dt_substep = dt / len(lineSpaceRange)
+    
+    if DEBUG and i % 5 == 0:
+        print(f"\n{'='*70}")
+        print(f"TIME STEP {i}: t={US06Time[i]:.1f}s, desired_speed={desired_speed:.2f} m/s")
+        print(f"  Current actual_speed={US06VehicleSimulation.actual_speed:.2f} m/s")
+        print(f"  dt={dt:.3f}s, dt_substep={dt_substep:.6f}s, num_substeps={len(lineSpaceRange)}")
+    
+    # Track cumulative torque application
+    total_torque_impulse = 0
+    substep_count = {'DRIVING': 0, 'BRAKING': 0, 'COASTING': 0}
+    
+    for j in range(len(US06yInterp)):
+        # PI controller generates voltage reference
+        V_ref, US06VehicleSimulation.integral = func.pi_controller(
+            US06yInterp[j], US06VehicleSimulation.actual_speed, US06VehicleSimulation.integral, dt_substep
+        )
+        
+        speed_error = US06yInterp[j] - US06VehicleSimulation.actual_speed
+        
+        # Get battery voltage
+        V_batt = US06BatteryPack.update_battery_voltage()
+        
+        # Determine mode and get motor voltage
+        if speed_error > 0.1:
+            mode = "DRIVING"
+            V_motor, V_arm = func.buckConverter(US06BatteryPack.soc, V_batt, V_ref)
+        elif speed_error < -0.1:
+            mode = "BRAKING"
+            V_motor, V_arm = func.regenerativeBrakeConverter(
+                US06BatteryPack.soc, V_batt, abs(V_ref)
+            )
+        else:
+            mode = "COASTING"
+            V_motor = 0
+            V_arm = 0
+        substep_count[mode] += 1
+        # CRITICAL FIX: If V_motor is 0, we cannot produce torque
+        if abs(V_motor) < 0.1:
+            motor_current = 0
+            motor_torque = 0
+        else:   
+            motor_angular_vel = func.angularVelocity(US06VehicleSimulation.actual_speed, var.gearRatio)
+            
+            # Calculate desired acceleration for THIS substep
+            if j == 0:
+                acc_desired = 0
+            else:
+                acc_desired = (US06yInterp[j] - US06yInterp[j-1]) / dt_substep
+            
+            # CRITICAL FIX: Resistance forces are NEGATIVE (oppose motion)
+            f_tr_desired = (var.rotationalInertiaCoeff * var.vehicleMass * acc_desired + 
+                            func.fRoll(US06yInterp[j]) + 
+                            func.fAerodynamic(US06yInterp[j]))
+            
+            required_power = func.powerFromForce(abs(f_tr_desired), US06yInterp[j])
+            wheel_angular_vel = func.angularVelocity(US06yInterp[j], 1)
+            required_wheel_torque = required_power / wheel_angular_vel if wheel_angular_vel > 0.01 else 0
+            required_motor_torque = required_wheel_torque / var.gearRatio
+            
+            # Apply sign based on mode
+            if mode == "BRAKING":
+                required_motor_torque = -abs(required_motor_torque)
+            else:
+                required_motor_torque = abs(required_motor_torque)
+            
+            # Calculate actual achievable current and torque
+            motor_current = func.currentFromTorqueAndSpeed(
+                motor_angular_vel, required_motor_torque, V_motor
+            )
+            motor_torque = motor_current * var.motorConstant
+            
+            # Check for NaN/Inf
+            if np.isnan(motor_torque) or np.isinf(motor_torque):
+                print(f"ERROR at i={i}, j={j}: motor_torque is {motor_torque}")
+                print(f"  motor_current={motor_current}, V_motor={V_motor}")
+                print(f"  required_motor_torque={required_motor_torque}")
+                motor_torque = 0
+                motor_current = 0
+        # CRITICAL FIX: Update vehicle dynamics at EACH substep!
+        actual_speed, actual_accel = US06VehicleSimulation.update_vehicle_dynamics(
+            motor_torque, dt_substep
+        )
+        # Update battery for this substep
+        soc, pack_voltage, _ = US06BatteryPack.update_battery(motor_current, dt_substep)
+        total_torque_impulse += motor_torque * dt_substep
+        # Store the final values from this substep
+        US06VehicleSimulation.motor_current = motor_current
+        US06VehicleSimulation.motor_torque = motor_torque
+        US06VehicleSimulation.motor_voltage = V_motor
+        # Check for runaway
+        if US06VehicleSimulation.actual_speed > 100:  # 100 m/s = 360 km/h, clearly wrong
+            print(f"\nERROR: Speed runaway detected at i={i}, j={j}")
+            print(f"  Speed={US06VehicleSimulation.actual_speed:.2f} m/s")
+            print(f"  motor_torque={motor_torque:.2f} Nm")
+            print(f"  mode={mode}, V_motor={V_motor:.2f} V")
+            raise ValueError("Simulation diverged - speed runaway") 
+    # Debug output for this major time step
+    if DEBUG and i % 5 == 0:
+        print(f"\n  Substep summary: {substep_count}")
+        print(f"  Total torque impulse: {total_torque_impulse:.2f} Nm·s")
+        print(f"  Final speed: {US06VehicleSimulation.actual_speed:.2f} m/s")
+        print(f"  Final acceleration: {US06VehicleSimulation.actual_acceleration:.3f} m/s²")
+        print(f"  Speed error: {desired_speed - US06VehicleSimulation.actual_speed:.2f} m/s")
+        print(f"  Battery SOC: {soc:.1f}%")
+    # Save results for this major time step
+    US06results.append({
+        'time': US06Time[i],
+        'desired_speed': desired_speed,
+        'actual_speed': US06VehicleSimulation.actual_speed,
+        'actual_acceleration': US06VehicleSimulation.actual_acceleration,
+        'motor_torque': US06VehicleSimulation.motor_torque,
+        'motor_current': US06VehicleSimulation.motor_current,
+        'motor_voltage': US06VehicleSimulation.motor_voltage,
+        'battery_voltage': pack_voltage,
+        'soc': soc,
+        'V_ref': V_ref,
+        'mode': mode
+    })  
+#plot results
+US06results_df = pd.DataFrame(US06results)
+plt.figure(figsize=(12, 8))
+plt.subplot(2, 2, 1)
+plt.plot(US06results_df['time'], US06results_df['actual_speed'], label='Actual Speed', color='green', linewidth=2)
+plt.plot(US06results_df['time'], US06results_df['desired_speed'], label='Desired Speed', color='orange', linestyle='--', linewidth=2)
+plt.title('Vehicle Speed vs Time (US06)')
+plt.xlabel('Time (s)')
+plt.ylabel('Speed (m/s)')
+plt.legend()
+plt.grid(True)      
 
-#     f_tr_desired = (var.rotationalInertiaCoeff * var.vehicleMass * acc_desired +
-#                     func.fRoll(desired_speed) + 
-#                     func.fAerodynamic(desired_speed) + 
-#                     func.fgxt())
-#     required_power = func.powerFromForce(abs(f_tr_desired), desired_speed)
-#     wheel_angular_vel = func.angularVelocity(desired_speed, 1)
-#     required_wheel_torque = required_power / wheel_angular_vel if wheel_angular_vel != 0 else 0
-#     required_motor_torque = required_wheel_torque / var.gearRatio
-#     if mode == "BRAKING":
-#         required_motor_torque = -abs(required_motor_torque)
-#     else:
-#         required_motor_torque = abs(required_motor_torque)
-#     vehicle.motor_current = func.currentFromTorqueAndSpeed(
-#         motor_angular_vel, required_motor_torque, V_motor
-#     )
-#     vehicle.motor_torque = vehicle.motor_current * var.motorConstant
-#     old_speed = UDDSvehicle.actual_speed
-#     actual_speed, actual_accel = UDDSvehicle.update_vehicle_dynamics(UDDSvehicle.motor_torque, dt)
-#     soc, pack_voltage, _ = UDDSbatteryPack.update_battery(UDDSvehicle.motor_current, dt)
-#     UDDSresults.append({
-#         "time": UDDSTime[i],
-#         "desired_speed": desired_speed,
-#         "actual_speed": actual_speed,
-#         "motor_current": UDDSvehicle.motor_current,
-#         "motor_torque": UDDSvehicle.motor_torque,
-#         "soc": soc,
-#         "pack_voltage": pack_voltage,
-#         "mode": mode
-#     })
+plt.subplot(2, 2, 2)
+plt.plot(US06results_df['time'], US06results_df['soc'], label='SOC', color='blue', linewidth=2)
+plt.title('Battery State of Charge (US06)')
+plt.xlabel('Time (s)')
+plt.ylabel('SOC (%)')
+plt.legend()
+plt.grid(True)
 
-# UDDSresults_df = pd.DataFrame(UDDSresults)
-# plt.figure()    
-# plt.plot(UDDSresults_df['time'], UDDSresults_df['actual_speed'], label='Actual Speed', color='green')
-# plt.plot(UDDSresults_df['time'], UDDSresults_df['desired_speed'], label='Desired Speed', color='orange', linestyle='--')
-# plt.title('UDDS Vehicle Speed vs Time')
-# plt.xlabel('Time (seconds)')
-# plt.ylabel('Speed (m/s)')
-# plt.legend()
-# plt.grid(True)
-  
-# plt.figure()
-# plt.plot(UDDSresults_df['time'], UDDSresults_df['soc'], label='State of Charge (SOC)', color='blue')
-# plt.title('UDDS Battery State of Charge vs Time')
-# plt.xlabel('Time (seconds)')
-# plt.ylabel('SOC (%)')
-# plt.legend()
-# plt.grid(True)
-  
-# plt.figure()
-# plt.plot(UDDSresults_df['time'], UDDSresults_df['pack_voltage'], label='Battery Voltage', color='red')
-# plt.title('UDDS Battery Voltage vs Time')
-# plt.xlabel('Time (seconds)')
-# plt.ylabel('Battery Voltage (V)')
-# plt.legend()    
-# plt.grid(True)
-  
-# plt.figure()
-# plt.plot(UDDSresults_df['time'], UDDSresults_df['motor_current'], label='Battery Current', color='purple')
-# plt.title('UDDS Battery Current vs Time')
-# plt.xlabel('Time (seconds)')
-# plt.ylabel('Battery Current (A)')
-# plt.legend()
+plt.subplot(2, 2, 3)
+plt.plot(US06results_df['time'], US06results_df['motor_torque'], label='Motor Torque', color='red', linewidth=2)
+plt.title('Motor Torque (US06)')
+plt.xlabel('Time (s)')
+plt.ylabel('Torque (Nm)')
+plt.legend()
+plt.grid(True)
 
-# US06vehicle = VehicleSimulation()
-# US06batteryPack = bc.BatteryPack()
-# US06data = pd.read_csv('US06.csv')
-# US06Time = US06data['Time (seconds)'].values
-# US06Speed = US06data['Speed (mph)'].values / 2.237
-# US06accDesired = np.gradient(US06Speed, US06Time)
-# US06distance = np.trapezoid(US06Speed, US06Time)
-# US06results = []
-
-# for i in range(len(US06Time)):
-#     desired_speed = US06Speed[i]
-#     dt = 1
-#     initial_actual_speed = US06vehicle.actual_speed
-#     V_ref, US06vehicle.integral = func.pi_controller(desired_speed, US06vehicle.actual_speed, US06vehicle.integral, dt)
-#     speed_error = desired_speed - US06vehicle.actual_speed
-
-#     if speed_error > 0.1:
-#         mode = "DRIVING"
-#         V_batt = US06batteryPack.update_battery_voltage()
-#         V_motor, V_arm = func.buckConverter(US06batteryPack.soc, V_batt, V_ref)
-#         motor_current_sign = 1
-
-#     elif speed_error < -0.1:
-#         mode = "BRAKING"
-#         V_batt = US06batteryPack.update_battery_voltage()
-#         V_motor, V_arm = func.regenerativeBrakeConverter(US06batteryPack.soc, V_batt, abs(V_ref))
-#         motor_current_sign = -1
-
-#     else:
-#         mode = "COASTING"
-#         V_batt = US06batteryPack.update_battery_voltage()
-#         V_motor, V_arm = func.buckConverter(US06batteryPack.soc, V_batt, V_ref)
-#         motor_current_sign = 1
-
-#     motor_angular_vel = func.angularVelocity(US06vehicle.actual_speed, var.gearRatio)
-#     if i == 0:
-#         acc_desired = 0
-#     else:
-#         acc_desired = (US06Speed[i] - US06Speed[i-1]) / dt
-
-#     f_tr_desired = -(var.rotationalInertiaCoeff * var.vehicleMass * acc_desired +
-#                     func.fRoll(desired_speed) +
-#                     func.fAerodynamic(desired_speed) +
-#                     func.fgxt())
-#     print(f_tr_desired)
-#     print(func.fRoll(desired_speed), 
-#           func.fAerodynamic(desired_speed), 
-#           func.fgxt(),
-#           var.rotationalInertiaCoeff * var.vehicleMass * acc_desired)
-#     required_power = func.powerFromForce(abs(f_tr_desired), desired_speed)
-#     wheel_angular_vel = func.angularVelocity(desired_speed, 1)
-#     required_wheel_torque = required_power / wheel_angular_vel if wheel_angular_vel != 0 else 0
-#     required_motor_torque = required_wheel_torque / var.gearRatio
-#     if mode == "BRAKING":
-#         required_motor_torque = -abs(required_motor_torque)
-#     else:
-#         required_motor_torque = abs(required_motor_torque)
-
-#     US06vehicle.motor_current = func.currentFromTorqueAndSpeed(
-#         motor_angular_vel, required_motor_torque, V_motor
-#     )
-#     US06vehicle.motor_torque = US06vehicle.motor_current * var.motorConstant
-#     old_speed = US06vehicle.actual_speed
-#     actual_speed, actual_accel = US06vehicle.update_vehicle_dynamics(US06vehicle.motor_torque, dt)
-#     soc, pack_voltage, _ = US06batteryPack.update_battery(US06vehicle.motor_current, dt)
-#     US06results.append({
-#         "time": US06Time[i],
-#         "desired_speed": desired_speed,
-#         "actual_speed": actual_speed,
-#         "desired_acceleration": acc_desired,
-#         "actual_acceleration": actual_accel,
-#         "motor_current": vehicle.motor_current,
-#         "motor_torque": vehicle.motor_torque,
-#         "battery_soc": soc,
-#         "battery_voltage": pack_voltage,
-#         "mode": mode
-#     })
-
-# US06results_df = pd.DataFrame(US06results)
-
-# plt.figure()
-# plt.plot(US06results_df['time'], US06results_df['actual_speed'], label='Actual Speed', color='green')
-# plt.plot(US06results_df['time'], US06results_df['desired_speed'], label='Desired Speed', color='orange', linestyle='--')
-# plt.title('US06 Vehicle Speed vs Time')
-# plt.xlabel('Time (seconds)')
-# plt.ylabel('Speed (m/s)')
-# plt.legend()
-# plt.grid(True)
-
-# plt.figure()
-# plt.plot(US06results_df['time'], US06results_df['battery_soc'], label='State of Charge (SOC)', color='blue')
-# plt.title('US06 Battery State of Charge vs Time')
-# plt.xlabel('Time (seconds)')
-# plt.ylabel('SOC (%)')
-# plt.legend()
-# plt.grid(True)
-
-# plt.figure()
-# plt.plot(US06results_df['time'], US06results_df['battery_voltage'], label='Battery Voltage', color='red')
-# plt.title('US06 Battery Voltage vs Time')
-# plt.xlabel('Time (seconds)')
-# plt.ylabel('Battery Voltage (V)')
-# plt.legend()
-# plt.grid(True)
-
-# plt.figure()
-# plt.plot(US06results_df['time'], US06results_df['motor_current'], label='Battery Current', color='purple')
-# plt.title('US06 Battery Current vs Time')
-# plt.xlabel('Time (seconds)')
-# plt.ylabel('Battery Current (A)')
-# plt.legend()
-# plt.grid(True)
-
-# x = input("press enter to print all graphs ... ")
-# if x == "":
-#     plt.close('all')
-
-# print("Simulation completed and plots generated.")
-# print(f"Total distance traveled in HWFET cycle: {HWdistance} meters")
-# print(f"Total distance traveled in UDDS cycle: {UDDSdistance} meters")
-# print(f"Total distance traveled in US06 cycle: {US06distance} meters")
+plt.subplot(2, 2, 4)
+plt.plot(US06results_df['time'], US06results_df['motor_current'], label='Motor Current', color='purple', linewidth=2)
+plt.title('Motor Current (US06)')
+plt.xlabel('Time (s)')
+plt.ylabel('Current (A)')
+plt.legend()
+plt.grid(True)  
+plt.tight_layout()
+plt.show()  
+print(f"\nDistance traveled (US06): {np.trapezoid(US06results_df['actual_speed'], US06results_df['time']):.2f} meters")

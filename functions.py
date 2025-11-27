@@ -153,6 +153,16 @@ def regenerativeBrakeConverter(soc, vBatt, vRef):
     vArm = vMotor
     return vMotor, vArm
 def currentFromTorqueAndSpeed(angularVelocity, torque, terminalVoltage):
+    """
+    Calculate motor current based on torque, speed, and available voltage.
+    
+    CRITICAL FIX: When terminal voltage is 0, motor cannot produce torque
+    regardless of back-EMF conditions.
+    """
+    # If no voltage applied, no current can flow (except in regen with external circuit)
+    if abs(terminalVoltage) < 0.1:  # Essentially zero voltage
+        return 0.0
+    
     # Required current for torque
     I_torque = torque / var.motorConstant
     
@@ -162,19 +172,29 @@ def currentFromTorqueAndSpeed(angularVelocity, torque, terminalVoltage):
     # Available voltage for current flow
     available_voltage = terminalVoltage - E_a
     
-    # If we want positive torque but back EMF is too high
-    if I_torque > 0 and available_voltage <= 0:
-        # Cannot produce positive torque - coast instead of braking
-        return 0
-    
-    # Maximum possible current
-    max_current = available_voltage / var.armatureResistance
-    
-    # Limit current to physical capability
+    # For motoring (positive torque)
     if I_torque > 0:
-        return min(I_torque, max_current)
+        if available_voltage <= 0:
+            # Cannot produce positive torque - back EMF too high
+            return 0.0
+        
+        # Maximum possible current given voltage constraint
+        max_current = available_voltage / var.armatureResistance
+        return min(I_torque, max_current, var.ratedArmatureCurrent)
+    
+    # For braking (negative torque/current)
     else:
-        return max(I_torque, max_current)
+        # In regenerative braking, we need a charging circuit
+        # If terminalVoltage = 0, we can't brake electrically
+        if abs(terminalVoltage) < 1.0:
+            return 0.0
+        
+        # Available voltage must be negative for regen
+        if available_voltage >= 0:
+            return 0.0
+            
+        max_current = available_voltage / var.armatureResistance
+        return max(I_torque, max_current, -var.ratedArmatureCurrent)
     
 def pi_controller(desired_speed, actual_speed, integral, dt):
     """PI controller generates V_ref for power electronics"""
